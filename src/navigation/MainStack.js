@@ -62,6 +62,7 @@ function BottomTabs() {
 }
 
 // 2. Main Stacks
+// 2. Main Stacks
 export default function MainStack() {
   return (
     <Stack.Navigator>
