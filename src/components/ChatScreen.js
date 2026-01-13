@@ -65,6 +65,8 @@ export default function ChatScreen({ route }) {
   };
 
   // --- SEND MESSAGE ---
+  // --- SEND MESSAGE ---
+
   const sendMessage = async () => {
     if (!newMessage.trim() && !image) return;
     if (!roomId || !user?.id) return;
