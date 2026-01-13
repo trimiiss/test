@@ -61,7 +61,7 @@ function BottomTabs() {
   );
 }
 
-// 2. Main Stackssss
+// 2. Main Stacksssshfg
 // 2. Main Stackssssfwreewr
 export default function MainStack() {
   return (
