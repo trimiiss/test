@@ -9,40 +9,41 @@ import { supabase } from '../supabaseClient';
 import GroupsScreen from '../screens/GroupsScreen';
 import ContactsScreen from '../screens/ContactsScreen';
 import ProfileScreen from '../screens/ProfileScreen';
+
+// 👇 THIS IS THE FIX: Point to 'components', not 'screens'
 import ChatScreen from '../components/ChatScreen'; 
 
 const Tab = createBottomTabNavigator();
 const Stack = createNativeStackNavigator();
 
-// --- LOGOUT BUTTON COMPONENT ---
+// --- LOGOUT BUTTON ---
 const LogoutButton = () => {
   const handleLogout = async () => {
-    Alert.alert('Log Out', 'Are you sure you want to log out?', [
+    Alert.alert('Log Out', 'Are you sure?', [
       { text: 'Cancel', style: 'cancel' },
       { 
         text: 'Log Out', 
         style: 'destructive', 
         onPress: async () => {
             const { error } = await supabase.auth.signOut();
-            if (error) console.log("Error logging out:", error.message);
+            if (error) console.log("Error:", error.message);
         }
       }
     ]);
   };
-
   return (
     <TouchableOpacity onPress={handleLogout} style={{ marginRight: 15 }}>
-      <Text style={{ color: '#ff3b30', fontWeight: 'bold', fontSize: 16 }}>Log Out</Text>
+      <Text style={{ color: '#ff3b30', fontWeight: 'bold' }}>Log Out</Text>
     </TouchableOpacity>
   );
 };
 
-// 1. Create the Bottom Tabs
+// 1. BOTTOM TABS
 function BottomTabs() {
   return (
     <Tab.Navigator
       screenOptions={({ route }) => ({
-        headerRight: () => <LogoutButton />, // <--- SHOWS LOGOUT ON EVERY TAB
+        headerRight: () => <LogoutButton />,
         tabBarIcon: ({ focused, color, size }) => {
           let iconName;
           if (route.name === 'Groups') iconName = focused ? 'chatbubbles' : 'chatbubbles-outline';
@@ -50,8 +51,6 @@ function BottomTabs() {
           else if (route.name === 'Profile') iconName = focused ? 'person' : 'person-outline';
           return <Ionicons name={iconName} size={size} color={color} />;
         },
-        tabBarActiveTintColor: '#007AFF',
-        tabBarInactiveTintColor: 'gray',
       })}
     >
       <Tab.Screen name="Groups" component={GroupsScreen} />
@@ -61,17 +60,27 @@ function BottomTabs() {
   );
 }
 
-// 2. Main Stacksssshfg
-// 2. Main Stackssssfwreewr
+// 2. MAIN STACK
 export default function MainStack() {
   return (
     <Stack.Navigator>
+      
+      {/* Home (Tabs) */}
       <Stack.Screen 
         name="Home" 
         component={BottomTabs} 
         options={{ headerShown: false }} 
       />
-      <Stack.Screen name="Chat" component={ChatScreen} />
+      
+      {/* Chat Screen */}
+      <Stack.Screen 
+        name="ChatScreen" 
+        component={ChatScreen} 
+        options={({ route }) => ({ 
+          title: route.params?.roomName || 'Chat' 
+        })}
+      />
+
     </Stack.Navigator>
   );
 }

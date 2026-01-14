@@ -1,71 +1,134 @@
-import React, { useState, useEffect } from 'react';
-import { View, Text, FlatList, TouchableOpacity, StyleSheet, Alert } from 'react-native';
+import React, { useEffect, useState } from 'react';
+import { 
+  View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator, Alert 
+} from 'react-native';
 import { supabase } from '../supabaseClient';
+import { Ionicons } from '@expo/vector-icons';
 
 export default function ContactsScreen({ navigation }) {
-  const [profiles, setProfiles] = useState([]);
+  const [contacts, setContacts] = useState([]);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetchProfiles();
+    fetchContacts();
   }, []);
 
-  async function fetchProfiles() {
+  const fetchContacts = async () => {
+    // 1. Get the current logged-in user
     const { data: { user } } = await supabase.auth.getUser();
-    
-    // Fetch everyone EXCEPT me
+
+    if (!user) {
+      setLoading(false);
+      return;
+    }
+
+    // 2. Fetch profiles, but EXCLUDE the current user using .neq()
     const { data, error } = await supabase
-      .from('profiles')
+      .from('profiles') 
       .select('*')
-      .neq('id', user.id);
+      .neq('id', user.id); // <--- This means "Not Equal to My ID"
 
-    if (!error) setProfiles(data);
-  }
-
-  // --- Helper to generate Initials ---
-  const getInitials = (item) => {
-    // If they have a "full_name", use first letter. Otherwise use email.
-    const name = item.full_name || item.email; 
-    return name.charAt(0).toUpperCase();
+    if (error) {
+      console.log('Error fetching contacts:', error.message);
+    } else {
+      setContacts(data || []);
+    }
+    setLoading(false);
   };
 
-  const getDisplayName = (item) => {
-    return item.full_name || item.email;
-  }
+  const handleContactPress = async (contact) => {
+    const contactName = contact.username || contact.email || 'User';
+    const roomName = `Chat with ${contactName}`;
+
+    try {
+      // Check if room exists
+      const { data: existingRooms, error: fetchError } = await supabase
+        .from('rooms')
+        .select('*')
+        .eq('name', roomName)
+        .limit(1);
+
+      if (fetchError) throw fetchError;
+
+      let targetRoomId;
+
+      if (existingRooms && existingRooms.length > 0) {
+        targetRoomId = existingRooms[0].id;
+      } else {
+        // Create new PRIVATE room (is_group: false)
+        const { data: newRoom, error: createError } = await supabase
+          .from('rooms')
+          .insert({ 
+            name: roomName,
+            is_group: false 
+          })
+          .select()
+          .single();
+
+        if (createError) throw createError;
+        targetRoomId = newRoom.id;
+      }
+
+      navigation.navigate('ChatScreen', { 
+        roomId: targetRoomId, 
+        roomName: roomName 
+      });
+
+    } catch (error) {
+      Alert.alert("Error", "Could not start chat: " + error.message);
+    }
+  };
+
+  if (loading) return <View style={styles.center}><ActivityIndicator size="large" /></View>;
 
   return (
     <View style={styles.container}>
-      <Text style={styles.header}>Contacts</Text>
-      <FlatList
-        data={profiles}
-        keyExtractor={(item) => item.id}
-        renderItem={({ item }) => (
-          <TouchableOpacity 
-            style={styles.contactItem} 
-            onPress={() => navigation.navigate('Chat', { roomId: null, roomName: getDisplayName(item) })} 
-            // Note: In a real app, you'd create a unique room ID for 1-on-1 chats here
-          >
-            {/* The Avatar Bubble */}
-            <View style={styles.avatar}>
-              <Text style={styles.avatarText}>{getInitials(item)}</Text>
-            </View>
-            
-            <View>
-              <Text style={styles.nameText}>{getDisplayName(item)}</Text>
-              <Text style={styles.emailText}>{item.email}</Text>
-            </View>
-          </TouchableOpacity>
-        )}
-      />
+      {contacts.length === 0 ? (
+        <View style={styles.center}>
+          <Text style={styles.emptyText}>No other contacts found.</Text>
+          <Text style={styles.subText}>You are the only user so far!</Text>
+        </View>
+      ) : (
+        <FlatList
+          data={contacts}
+          keyExtractor={(item) => item.id.toString()}
+          renderItem={({ item }) => (
+            <TouchableOpacity 
+              style={styles.item} 
+              onPress={() => handleContactPress(item)}
+            >
+              <View style={styles.avatar}>
+                <Ionicons name="person" size={20} color="#fff" />
+              </View>
+              <Text style={styles.name}>{item.username || item.email}</Text>
+            </TouchableOpacity>
+          )}
+        />
+      )}
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, padding: 20, backgroundColor: '#fff' },
-  header: { fontSize: 24, fontWeight: 'bold', marginBottom: 20 },
-  contactItem: { flexDirection: 'row', alignItems: 'center', padding: 15, borderBottomWidth: 1, borderBottomColor: '#f0f0f0' },
-  avatar: { width: 50, height: 50, borderRadius: 25, backgroundColor: '#5D3FD3', justifyContent: 'center', alignItems: 'center', marginRight: 15 },
-  avatarText: { color: '#fff', fontSize: 20, fontWeight: 'bold' },
-  nameText: { fontSize: 16, fontWeight: 'bold' },
-  emailText: { fontSize: 12, color: 'gray' }
+  container: { flex: 1, backgroundColor: '#fff' },
+  center: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 20 },
+  item: { 
+    flexDirection: 'row', 
+    padding: 15, 
+    borderBottomWidth: 1, 
+    borderColor: '#eee', 
+    alignItems: 'center' 
+  },
+  avatar: {
+    width: 40, 
+    height: 40, 
+    borderRadius: 20, 
+    backgroundColor: '#ccc', 
+    justifyContent: 'center', 
+    alignItems: 'center',
+    marginRight: 15
+  },
+  name: { fontSize: 16, fontWeight: 'bold' },
+  emptyText: { fontSize: 18, fontWeight: 'bold', marginBottom: 5 },
+  subText: { color: '#888', textAlign: 'center' }
 });
