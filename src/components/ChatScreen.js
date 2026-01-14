@@ -1,44 +1,59 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   View, Text, TextInput, TouchableOpacity, FlatList, StyleSheet, 
-  KeyboardAvoidingView, Platform, ActivityIndicator, Alert 
+  KeyboardAvoidingView, Platform, ActivityIndicator, Alert, Image, LogBox 
 } from 'react-native';
 import { supabase } from '../supabaseClient';
 import { Ionicons } from '@expo/vector-icons';
+import * as ImagePicker from 'expo-image-picker';
+import { decode } from 'base64-arraybuffer';
+import * as FileSystem from 'expo-file-system';
+import { Audio } from 'expo-av';
+
+// Hide the "Expo AV is deprecated" warning so the app looks clean
+LogBox.ignoreLogs(['Expo AV has been deprecated']);
 
 export default function ChatScreen({ route, navigation }) {
   const { roomId, roomName } = route.params || {};
 
+  // Messages & Input State
   const [messages, setMessages] = useState([]);
   const [inputText, setInputText] = useState('');
   const [loading, setLoading] = useState(true);
+  const [uploading, setUploading] = useState(false);
   
+  // Audio State
+  const [recording, setRecording] = useState(null);
+  const [isRecording, setIsRecording] = useState(false);
+  const [sound, setSound] = useState(null); 
+  const [playingAudioId, setPlayingAudioId] = useState(null);
+
   // User Info
   const [currentUserId, setCurrentUserId] = useState(null);
   const [currentUsername, setCurrentUsername] = useState('User');
+  const [currentUserAvatar, setCurrentUserAvatar] = useState(null);
 
-  // Edit Mode
+  // Edit / Typing Indicators
   const [editingMessage, setEditingMessage] = useState(null); 
-
-  // --- TYPING INDICATOR STATE ---
   const [typingText, setTypingText] = useState(''); 
   const typingTimeoutRef = useRef(null); 
   const lastTypedTime = useRef(0); 
-  
-  // --- FIX: Store the active channel here ---
   const channelRef = useRef(null);
 
   useEffect(() => {
+    // 1. Get Current User Info
     const fetchUser = async () => {
       const { data: { user } } = await supabase.auth.getUser();
       if (user) {
         setCurrentUserId(user.id);
         const { data: profile } = await supabase
           .from('profiles')
-          .select('username')
+          .select('username, avatar_url')
           .eq('id', user.id)
           .maybeSingle();
+
         setCurrentUsername(profile?.username || user.email);
+        setCurrentUserAvatar(profile?.avatar_url || null);
       }
     };
     fetchUser();
@@ -47,43 +62,31 @@ export default function ChatScreen({ route, navigation }) {
     navigation.setOptions({ title: roomName || 'Chat' });
     fetchMessages();
 
-    // --- REALTIME CHANNEL SETUP ---
-    // We assign it to channelRef.current so we can use it later to SEND signals
+    // 2. Realtime Subscription
     channelRef.current = supabase.channel(`room:${roomId}`)
-      // 1. Listen for Database Changes (Messages)
       .on('postgres_changes', 
         { event: '*', schema: 'public', table: 'messages', filter: `room_id=eq.${roomId}` },
         (payload) => handleRealtimeEvent(payload)
       )
-      // 2. Listen for "Typing" Broadcasts
       .on('broadcast', { event: 'typing' }, (payload) => {
-        // Only show if it's NOT me typing
         if (payload.payload.userId !== currentUserId) {
           setTypingText(`${payload.payload.username} is typing...`);
-          
-          // Clear the text after 3 seconds of silence
           if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
-          typingTimeoutRef.current = setTimeout(() => {
-            setTypingText('');
-          }, 3000);
+          typingTimeoutRef.current = setTimeout(() => setTypingText(''), 3000);
         }
       })
       .subscribe();
 
-    // Cleanup: Remove channel when leaving screen
     return () => {
       if (channelRef.current) supabase.removeChannel(channelRef.current);
+      if (sound) sound.unloadAsync();
     };
   }, [roomId, currentUserId]); 
 
   const handleRealtimeEvent = (payload) => {
-    if (payload.eventType === 'INSERT') {
-      setMessages((prev) => [payload.new, ...prev]);
-    } else if (payload.eventType === 'DELETE') {
-      setMessages((prev) => prev.filter(msg => msg.id !== payload.old.id));
-    } else if (payload.eventType === 'UPDATE') {
-      setMessages((prev) => prev.map(msg => msg.id === payload.new.id ? payload.new : msg));
-    }
+    if (payload.eventType === 'INSERT') setMessages(prev => [payload.new, ...prev]);
+    else if (payload.eventType === 'DELETE') setMessages(prev => prev.filter(msg => msg.id !== payload.old.id));
+    else if (payload.eventType === 'UPDATE') setMessages(prev => prev.map(msg => msg.id === payload.new.id ? payload.new : msg));
   };
 
   const fetchMessages = async () => {
@@ -96,15 +99,11 @@ export default function ChatScreen({ route, navigation }) {
     setLoading(false);
   };
 
-  // --- SEND TYPING EVENT (FIXED) ---
   const handleInputChange = (text) => {
     setInputText(text);
-
     const now = Date.now();
-    // Only send if 2 seconds passed since last check
+    // Broadcast typing every 2 seconds max
     if (now - lastTypedTime.current > 2000) {
-      
-      // FIX: Use channelRef.current to send
       if (channelRef.current) {
         channelRef.current.send({
           type: 'broadcast',
@@ -112,9 +111,147 @@ export default function ChatScreen({ route, navigation }) {
           payload: { username: currentUsername, userId: currentUserId }
         });
       }
-      
       lastTypedTime.current = now;
     }
+  };
+
+  // --- 📸 IMAGE PICKER ---
+  const pickImage = async () => {
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      allowsEditing: false,
+      quality: 0.7,
+      base64: true, // Needed for upload
+    });
+
+    if (!result.canceled && result.assets.length > 0) {
+      uploadFile(result.assets[0], 'image');
+    }
+  };
+
+  // --- 🎤 RECORDING FUNCTIONS ---
+  const startRecording = async () => {
+    try {
+      const permission = await Audio.requestPermissionsAsync();
+      if (permission.status !== 'granted') return Alert.alert('Permission needed', 'Microphone access is required.');
+
+      await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
+
+      const { recording } = await Audio.Recording.createAsync(
+        Audio.RecordingOptionsPresets.HIGH_QUALITY
+      );
+
+      setRecording(recording);
+      setIsRecording(true);
+    } catch (err) {
+      Alert.alert('Failed to start recording', err.message);
+    }
+  };
+
+  const stopRecording = async () => {
+    if (!recording) return;
+    
+    setIsRecording(false);
+    await recording.stopAndUnloadAsync();
+    
+    const uri = recording.getURI(); 
+    setRecording(null); // Reset state
+    
+    if (uri) {
+      // Pass an object with uri to uploadFile, mimicking the asset object structure
+      uploadFile({ uri }, 'audio');
+    }
+  };
+
+  // --- 🔊 PLAYBACK FUNCTIONS ---
+  const playSound = async (audioUrl, messageId) => {
+    try {
+      // If audio is already playing, stop it first
+      if (sound) {
+        await sound.unloadAsync();
+        setPlayingAudioId(null);
+      }
+
+      // Load new sound
+      const { sound: newSound } = await Audio.Sound.createAsync(
+        { uri: audioUrl },
+        { shouldPlay: true }
+      );
+      
+      setSound(newSound);
+      setPlayingAudioId(messageId);
+
+      // Reset UI when playback finishes
+      newSound.setOnPlaybackStatusUpdate((status) => {
+        if (status.didJustFinish) {
+          setPlayingAudioId(null);
+        }
+      });
+    } catch (error) {
+      Alert.alert("Playback Error", "Could not play audio");
+    }
+  };
+
+  // --- 📤 UNIVERSAL UPLOADER (Image & Audio) ---
+  const uploadFile = async (asset, type) => {
+    try {
+      setUploading(true);
+      const fileName = `${Date.now()}_${currentUserId}.${type === 'image' ? 'jpg' : 'm4a'}`;
+      const bucketName = type === 'image' ? 'chat-images' : 'chat-audio';
+
+      let base64;
+
+      if (type === 'image') {
+        base64 = asset.base64;
+      } else {
+        // Reads the audio file from local storage and converts to Base64
+        base64 = await FileSystem.readAsStringAsync(asset.uri, {
+          encoding: FileSystem.EncodingType.Base64,
+        });
+      }
+
+      if (!base64) throw new Error("Could not convert file to base64");
+
+      const { error } = await supabase.storage
+        .from(bucketName)
+        .upload(fileName, decode(base64), { 
+          contentType: type === 'image' ? 'image/jpeg' : 'audio/m4a' 
+        });
+
+      if (error) throw error;
+
+      const { data: urlData } = supabase.storage.from(bucketName).getPublicUrl(fileName);
+
+      await sendMessage(
+        null, 
+        type === 'image' ? urlData.publicUrl : null, 
+        type === 'audio' ? urlData.publicUrl : null
+      );
+
+    } catch (error) {
+      console.log("Upload Error:", error);
+      Alert.alert("Upload Failed", error.message);
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  // --- SEND MESSAGE TO DB ---
+  const sendMessage = async (text, imageUrl, audioUrl) => {
+    let content = text;
+    // Set placeholder text for notifications/lists if it's media
+    if (!content) content = imageUrl ? '📷 Image' : (audioUrl ? '🎤 Voice Message' : '');
+
+    const { error } = await supabase.from('messages').insert({
+      room_id: roomId,
+      content: content,
+      image_url: imageUrl,
+      audio_url: audioUrl,
+      sender_id: currentUserId,
+      sender_name: currentUsername,
+      sender_avatar: currentUserAvatar
+    });
+    if (error) Alert.alert("Error", "Could not send message");
   };
 
   const handleSendOrUpdate = async () => {
@@ -123,50 +260,60 @@ export default function ChatScreen({ route, navigation }) {
     setInputText(''); 
 
     if (editingMessage) {
-      const { error } = await supabase.from('messages').update({ content: textToSend }).eq('id', editingMessage.id);
-      if (error) Alert.alert("Error", "Update failed");
+      await supabase.from('messages').update({ content: textToSend }).eq('id', editingMessage.id);
       setEditingMessage(null);
     } else {
-      const { error } = await supabase.from('messages').insert({
-        room_id: roomId,
-        content: textToSend,
-        sender_id: currentUserId,
-        sender_name: currentUsername
-      });
-      if (error) Alert.alert("Error", "Send failed");
+      await sendMessage(textToSend, null, null);
     }
   };
 
-  const deleteMessage = async (messageId) => {
-    const { error } = await supabase.from('messages').delete().eq('id', messageId);
-    if (error) Alert.alert("Error", "Delete failed");
-  };
-
-  const handleLongPress = (item) => {
-    if (item.sender_id !== currentUserId) return;
-    Alert.alert("Options", "Choose action", [
-      { text: "Cancel", style: "cancel" },
-      { text: "Edit", onPress: () => { setEditingMessage(item); setInputText(item.content); } },
-      { text: "Delete", style: "destructive", onPress: () => deleteMessage(item.id) },
-    ]);
-  };
-
-  const cancelEdit = () => { setEditingMessage(null); setInputText(''); };
-
   const renderMessage = ({ item }) => {
     const isMe = item.sender_id === currentUserId;
-    const date = new Date(item.created_at);
-    const timeString = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const isPlaying = playingAudioId === item.id;
+    const timeString = new Date(item.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
     return (
-      <View style={[styles.messageContainer, isMe ? styles.myMessageContainer : styles.theirMessageContainer]}>
-        {!isMe && <Text style={styles.senderName}>{item.sender_name || 'Unknown'}</Text>}
-        <TouchableOpacity onLongPress={() => handleLongPress(item)} activeOpacity={0.8}>
-          <View style={[styles.bubble, isMe ? styles.myBubble : styles.theirBubble]}>
-            <Text style={[styles.messageText, isMe ? styles.myText : styles.theirText]}>{item.content}</Text>
-            <Text style={[styles.timeText, isMe ? styles.myTimeText : styles.theirTimeText]}>{timeString}</Text>
+      <View style={[styles.messageRow, isMe ? styles.rowRight : styles.rowLeft]}>
+        {!isMe && (
+          <View style={styles.avatarContainer}>
+             {item.sender_avatar ? (
+              <Image source={{ uri: item.sender_avatar }} style={styles.smallAvatar} />
+            ) : (
+              <View style={styles.placeholderAvatar}>
+                <Text style={styles.avatarText}>{item.sender_name?.charAt(0).toUpperCase()}</Text>
+              </View>
+            )}
           </View>
-        </TouchableOpacity>
+        )}
+        <View style={{ maxWidth: '80%' }}>
+           {!isMe && <Text style={styles.senderName}>{item.sender_name}</Text>}
+           <View style={[styles.bubble, isMe ? styles.myBubble : styles.theirBubble]}>
+             
+             {/* IMAGE */}
+             {item.image_url && <Image source={{ uri: item.image_url }} style={styles.messageImage} />}
+             
+             {/* AUDIO PLAYER */}
+             {item.audio_url && (
+                <TouchableOpacity style={styles.audioBubble} onPress={() => playSound(item.audio_url, item.id)}>
+                   <Ionicons 
+                     name={isPlaying ? "pause-circle" : "play-circle"} 
+                     size={30} 
+                     color={isMe ? "#fff" : "#007AFF"} 
+                   />
+                   <Text style={{ color: isMe ? '#fff' : '#000', marginLeft: 5 }}>
+                     {isPlaying ? "Playing..." : "Voice Message"}
+                   </Text>
+                </TouchableOpacity>
+             )}
+
+             {/* TEXT */}
+             {(!item.image_url && !item.audio_url) && (
+               <Text style={[styles.messageText, isMe ? styles.myText : styles.theirText]}>{item.content}</Text>
+             )}
+
+             <Text style={[styles.timeText, isMe ? styles.myTimeText : styles.theirTimeText]}>{timeString}</Text>
+           </View>
+        </View>
       </View>
     );
   };
@@ -175,42 +322,45 @@ export default function ChatScreen({ route, navigation }) {
 
   return (
     <View style={styles.container}>
-      <FlatList
-        data={messages}
-        keyExtractor={(item) => item.id.toString()}
-        inverted
-        contentContainerStyle={styles.listContent}
-        renderItem={renderMessage}
+      <FlatList 
+        data={messages} 
+        keyExtractor={i => i.id.toString()} 
+        inverted 
+        contentContainerStyle={styles.listContent} 
+        renderItem={renderMessage} 
       />
-
+      
       <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} keyboardVerticalOffset={90}>
+        {typingText !== '' && <View style={styles.typingContainer}><Text style={styles.typingText}>{typingText}</Text></View>}
         
-        {/* --- TYPING INDICATOR UI --- */}
-        {typingText !== '' && (
-          <View style={styles.typingContainer}>
-            <Text style={styles.typingText}>{typingText}</Text>
-          </View>
-        )}
-
-        {editingMessage && (
-          <View style={styles.editBar}>
-            <Text style={styles.editText}>Editing message...</Text>
-            <TouchableOpacity onPress={cancelEdit}><Ionicons name="close-circle" size={24} color="red" /></TouchableOpacity>
-          </View>
-        )}
-
         <View style={styles.inputContainer}>
-          <TextInput
-            style={styles.input}
-            placeholder="Type a message..."
-            placeholderTextColor="#888"
-            value={inputText}
-            onChangeText={handleInputChange} 
-            multiline
-          />
-          <TouchableOpacity onPress={handleSendOrUpdate} style={styles.sendButton}>
-            <Ionicons name={editingMessage ? "checkmark" : "send"} size={24} color="#fff" />
+          {/* CAMERA BUTTON */}
+          <TouchableOpacity onPress={pickImage} style={styles.iconButton} disabled={uploading}>
+             <Ionicons name="camera" size={24} color="#007AFF" />
           </TouchableOpacity>
+
+          {/* TEXT INPUT */}
+          <TextInput 
+            style={styles.input} 
+            placeholder="Type a message..." 
+            value={inputText} 
+            onChangeText={handleInputChange} 
+            multiline 
+          />
+
+          {/* SEND OR MIC BUTTON */}
+          {inputText.trim() ? (
+            <TouchableOpacity onPress={handleSendOrUpdate} style={styles.sendButton}>
+               <Ionicons name="send" size={24} color="#fff" />
+            </TouchableOpacity>
+          ) : (
+            <TouchableOpacity 
+               onPress={isRecording ? stopRecording : startRecording} 
+               style={[styles.micButton, isRecording && styles.recordingButton]}
+            >
+               <Ionicons name={isRecording ? "stop" : "mic"} size={24} color="#fff" />
+            </TouchableOpacity>
+          )}
         </View>
       </KeyboardAvoidingView>
     </View>
@@ -221,25 +371,39 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#f5f5f5' },
   center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   listContent: { padding: 15, paddingBottom: 20 },
-  messageContainer: { marginBottom: 10, maxWidth: '80%' },
-  myMessageContainer: { alignSelf: 'flex-end', alignItems: 'flex-end' },
-  theirMessageContainer: { alignSelf: 'flex-start', alignItems: 'flex-start' },
+  messageRow: { flexDirection: 'row', marginBottom: 10, alignItems: 'flex-end' },
+  rowRight: { justifyContent: 'flex-end' },
+  rowLeft: { justifyContent: 'flex-start' },
+  
+  avatarContainer: { marginRight: 8, marginBottom: 2 },
+  smallAvatar: { width: 30, height: 30, borderRadius: 15 },
+  placeholderAvatar: { width: 30, height: 30, borderRadius: 15, backgroundColor: '#ccc', justifyContent: 'center', alignItems: 'center' },
+  avatarText: { color: '#fff', fontSize: 12, fontWeight: 'bold' },
+
   senderName: { fontSize: 12, color: '#666', marginBottom: 4, marginLeft: 4 },
   bubble: { padding: 12, borderRadius: 20 },
   myBubble: { backgroundColor: '#007AFF', borderBottomRightRadius: 2 },
   theirBubble: { backgroundColor: '#E5E5EA', borderBottomLeftRadius: 2 },
+  
   messageText: { fontSize: 16 },
   myText: { color: '#fff' },
   theirText: { color: '#000' },
+  messageImage: { width: 200, height: 300, borderRadius: 10, resizeMode: 'contain', marginBottom: 5 },
+  
+  audioBubble: { flexDirection: 'row', alignItems: 'center', padding: 5, width: 150 },
+
   timeText: { fontSize: 10, marginTop: 5, textAlign: 'right' },
   myTimeText: { color: 'rgba(255, 255, 255, 0.7)' },
   theirTimeText: { color: 'rgba(0, 0, 0, 0.4)' },
+  
   inputContainer: { flexDirection: 'row', padding: 10, backgroundColor: '#fff', alignItems: 'center', borderTopWidth: 1, borderColor: '#eee' },
   input: { flex: 1, backgroundColor: '#f0f0f0', borderRadius: 20, paddingHorizontal: 15, paddingVertical: 10, fontSize: 16, maxHeight: 100, marginRight: 10 },
+  iconButton: { marginRight: 10, padding: 5 },
   sendButton: { backgroundColor: '#007AFF', width: 45, height: 45, borderRadius: 22.5, justifyContent: 'center', alignItems: 'center' },
-  editBar: { flexDirection: 'row', justifyContent: 'space-between', padding: 10, backgroundColor: '#eee', borderTopWidth: 1, borderColor: '#ccc' },
-  editText: { color: '#555', fontStyle: 'italic' },
   
+  micButton: { backgroundColor: '#34C759', width: 45, height: 45, borderRadius: 22.5, justifyContent: 'center', alignItems: 'center' },
+  recordingButton: { backgroundColor: '#FF3B30' },
+
   typingContainer: { paddingHorizontal: 20, paddingBottom: 5, backgroundColor: '#f5f5f5' },
   typingText: { fontSize: 12, color: '#888', fontStyle: 'italic' }
 });
