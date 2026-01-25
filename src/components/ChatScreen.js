@@ -7,11 +7,16 @@ import { supabase } from '../supabaseClient';
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import { decode } from 'base64-arraybuffer';
-import * as FileSystem from 'expo-file-system';
 import { Audio } from 'expo-av';
 
-// Hide the "Expo AV is deprecated" warning so the app looks clean
-LogBox.ignoreLogs(['Expo AV has been deprecated']);
+// --- 🛠️ FIX FOR CRASH: Import from 'legacy' for new Expo versions ---
+import * as FileSystem from 'expo-file-system/legacy'; 
+
+// --- IGNORE WARNINGS ---
+LogBox.ignoreLogs([
+  'Expo AV has been deprecated',
+  'Method readAsStringAsync',
+]);
 
 export default function ChatScreen({ route, navigation }) {
   const { roomId, roomName } = route.params || {};
@@ -41,7 +46,6 @@ export default function ChatScreen({ route, navigation }) {
   const channelRef = useRef(null);
 
   useEffect(() => {
-    // 1. Get Current User Info
     const fetchUser = async () => {
       const { data: { user } } = await supabase.auth.getUser();
       if (user) {
@@ -62,7 +66,7 @@ export default function ChatScreen({ route, navigation }) {
     navigation.setOptions({ title: roomName || 'Chat' });
     fetchMessages();
 
-    // 2. Realtime Subscription
+    // Realtime Subscription
     channelRef.current = supabase.channel(`room:${roomId}`)
       .on('postgres_changes', 
         { event: '*', schema: 'public', table: 'messages', filter: `room_id=eq.${roomId}` },
@@ -102,7 +106,6 @@ export default function ChatScreen({ route, navigation }) {
   const handleInputChange = (text) => {
     setInputText(text);
     const now = Date.now();
-    // Broadcast typing every 2 seconds max
     if (now - lastTypedTime.current > 2000) {
       if (channelRef.current) {
         channelRef.current.send({
@@ -121,7 +124,7 @@ export default function ChatScreen({ route, navigation }) {
       mediaTypes: ImagePicker.MediaTypeOptions.Images,
       allowsEditing: false,
       quality: 0.7,
-      base64: true, // Needed for upload
+      base64: true, 
     });
 
     if (!result.canceled && result.assets.length > 0) {
@@ -149,39 +152,38 @@ export default function ChatScreen({ route, navigation }) {
   };
 
   const stopRecording = async () => {
-    if (!recording) return;
-    
-    setIsRecording(false);
-    await recording.stopAndUnloadAsync();
-    
-    const uri = recording.getURI(); 
-    setRecording(null); // Reset state
-    
-    if (uri) {
-      // Pass an object with uri to uploadFile, mimicking the asset object structure
-      uploadFile({ uri }, 'audio');
+    try {
+      if (!recording) return;
+      
+      setIsRecording(false);
+      await recording.stopAndUnloadAsync();
+      
+      const uri = recording.getURI(); 
+      setRecording(null); 
+      
+      if (uri) {
+        // Send as object to uploadFile
+        await uploadFile({ uri }, 'audio');
+      }
+    } catch (error) {
+      console.log("Stop Recording Error:", error);
     }
   };
 
   // --- 🔊 PLAYBACK FUNCTIONS ---
   const playSound = async (audioUrl, messageId) => {
     try {
-      // If audio is already playing, stop it first
       if (sound) {
         await sound.unloadAsync();
         setPlayingAudioId(null);
       }
-
-      // Load new sound
       const { sound: newSound } = await Audio.Sound.createAsync(
         { uri: audioUrl },
         { shouldPlay: true }
       );
-      
       setSound(newSound);
       setPlayingAudioId(messageId);
 
-      // Reset UI when playback finishes
       newSound.setOnPlaybackStatusUpdate((status) => {
         if (status.didJustFinish) {
           setPlayingAudioId(null);
@@ -192,7 +194,7 @@ export default function ChatScreen({ route, navigation }) {
     }
   };
 
-  // --- 📤 UNIVERSAL UPLOADER (Image & Audio) ---
+  // --- 📤 UNIVERSAL UPLOADER ---
   const uploadFile = async (asset, type) => {
     try {
       setUploading(true);
@@ -204,9 +206,8 @@ export default function ChatScreen({ route, navigation }) {
       if (type === 'image') {
         base64 = asset.base64;
       } else {
-        // Reads the audio file from local storage and converts to Base64
         base64 = await FileSystem.readAsStringAsync(asset.uri, {
-          encoding: FileSystem.EncodingType.Base64,
+          encoding: 'base64', 
         });
       }
 
@@ -239,7 +240,6 @@ export default function ChatScreen({ route, navigation }) {
   // --- SEND MESSAGE TO DB ---
   const sendMessage = async (text, imageUrl, audioUrl) => {
     let content = text;
-    // Set placeholder text for notifications/lists if it's media
     if (!content) content = imageUrl ? '📷 Image' : (audioUrl ? '🎤 Voice Message' : '');
 
     const { error } = await supabase.from('messages').insert({
@@ -270,6 +270,7 @@ export default function ChatScreen({ route, navigation }) {
   const renderMessage = ({ item }) => {
     const isMe = item.sender_id === currentUserId;
     const isPlaying = playingAudioId === item.id;
+    const isImage = !!item.image_url; // Check if it's an image
     const timeString = new Date(item.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
     return (
@@ -287,10 +288,16 @@ export default function ChatScreen({ route, navigation }) {
         )}
         <View style={{ maxWidth: '80%' }}>
            {!isMe && <Text style={styles.senderName}>{item.sender_name}</Text>}
-           <View style={[styles.bubble, isMe ? styles.myBubble : styles.theirBubble]}>
+           
+           <View style={[
+             styles.bubble, 
+             isMe ? styles.myBubble : styles.theirBubble,
+             // 🔥 THIS IS THE FIX: Remove background and padding if it is an image
+             isImage && { backgroundColor: 'transparent', padding: 0 }
+           ]}>
              
              {/* IMAGE */}
-             {item.image_url && <Image source={{ uri: item.image_url }} style={styles.messageImage} />}
+             {isImage && <Image source={{ uri: item.image_url }} style={styles.messageImage} />}
              
              {/* AUDIO PLAYER */}
              {item.audio_url && (
@@ -311,7 +318,13 @@ export default function ChatScreen({ route, navigation }) {
                <Text style={[styles.messageText, isMe ? styles.myText : styles.theirText]}>{item.content}</Text>
              )}
 
-             <Text style={[styles.timeText, isMe ? styles.myTimeText : styles.theirTimeText]}>{timeString}</Text>
+             {/* TIME - If it is an image, force dark color because background is now light */}
+             <Text style={[
+               styles.timeText, 
+               (isMe && !isImage) ? styles.myTimeText : styles.theirTimeText
+             ]}>
+               {timeString}
+             </Text>
            </View>
         </View>
       </View>
@@ -334,12 +347,10 @@ export default function ChatScreen({ route, navigation }) {
         {typingText !== '' && <View style={styles.typingContainer}><Text style={styles.typingText}>{typingText}</Text></View>}
         
         <View style={styles.inputContainer}>
-          {/* CAMERA BUTTON */}
           <TouchableOpacity onPress={pickImage} style={styles.iconButton} disabled={uploading}>
              <Ionicons name="camera" size={24} color="#007AFF" />
           </TouchableOpacity>
 
-          {/* TEXT INPUT */}
           <TextInput 
             style={styles.input} 
             placeholder="Type a message..." 
@@ -348,7 +359,6 @@ export default function ChatScreen({ route, navigation }) {
             multiline 
           />
 
-          {/* SEND OR MIC BUTTON */}
           {inputText.trim() ? (
             <TouchableOpacity onPress={handleSendOrUpdate} style={styles.sendButton}>
                <Ionicons name="send" size={24} color="#fff" />
@@ -374,13 +384,12 @@ const styles = StyleSheet.create({
   messageRow: { flexDirection: 'row', marginBottom: 10, alignItems: 'flex-end' },
   rowRight: { justifyContent: 'flex-end' },
   rowLeft: { justifyContent: 'flex-start' },
-  
   avatarContainer: { marginRight: 8, marginBottom: 2 },
   smallAvatar: { width: 30, height: 30, borderRadius: 15 },
   placeholderAvatar: { width: 30, height: 30, borderRadius: 15, backgroundColor: '#ccc', justifyContent: 'center', alignItems: 'center' },
   avatarText: { color: '#fff', fontSize: 12, fontWeight: 'bold' },
-
   senderName: { fontSize: 12, color: '#666', marginBottom: 4, marginLeft: 4 },
+  
   bubble: { padding: 12, borderRadius: 20 },
   myBubble: { backgroundColor: '#007AFF', borderBottomRightRadius: 2 },
   theirBubble: { backgroundColor: '#E5E5EA', borderBottomLeftRadius: 2 },
@@ -388,10 +397,18 @@ const styles = StyleSheet.create({
   messageText: { fontSize: 16 },
   myText: { color: '#fff' },
   theirText: { color: '#000' },
-  messageImage: { width: 200, height: 300, borderRadius: 10, resizeMode: 'contain', marginBottom: 5 },
+  
+  // 🔥 UPDATED IMAGE STYLE (Corners + Sizing)
+  messageImage: { 
+    width: 200, 
+    height: 300, 
+    borderRadius: 15, 
+    resizeMode: 'cover', // Changed to cover so it looks nicer
+    marginBottom: 5 
+  },
   
   audioBubble: { flexDirection: 'row', alignItems: 'center', padding: 5, width: 150 },
-
+  
   timeText: { fontSize: 10, marginTop: 5, textAlign: 'right' },
   myTimeText: { color: 'rgba(255, 255, 255, 0.7)' },
   theirTimeText: { color: 'rgba(0, 0, 0, 0.4)' },
@@ -400,10 +417,8 @@ const styles = StyleSheet.create({
   input: { flex: 1, backgroundColor: '#f0f0f0', borderRadius: 20, paddingHorizontal: 15, paddingVertical: 10, fontSize: 16, maxHeight: 100, marginRight: 10 },
   iconButton: { marginRight: 10, padding: 5 },
   sendButton: { backgroundColor: '#007AFF', width: 45, height: 45, borderRadius: 22.5, justifyContent: 'center', alignItems: 'center' },
-  
   micButton: { backgroundColor: '#34C759', width: 45, height: 45, borderRadius: 22.5, justifyContent: 'center', alignItems: 'center' },
   recordingButton: { backgroundColor: '#FF3B30' },
-
   typingContainer: { paddingHorizontal: 20, paddingBottom: 5, backgroundColor: '#f5f5f5' },
   typingText: { fontSize: 12, color: '#888', fontStyle: 'italic' }
 });
