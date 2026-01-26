@@ -88,9 +88,22 @@ export default function ChatScreen({ route, navigation }) {
   }, [roomId, currentUserId]); 
 
   const handleRealtimeEvent = (payload) => {
-    if (payload.eventType === 'INSERT') setMessages(prev => [payload.new, ...prev]);
-    else if (payload.eventType === 'DELETE') setMessages(prev => prev.filter(msg => msg.id !== payload.old.id));
-    else if (payload.eventType === 'UPDATE') setMessages(prev => prev.map(msg => msg.id === payload.new.id ? payload.new : msg));
+    // Only process updates from OTHERS. 
+    // If it's my own action, I already updated the UI instantly.
+    
+    if (payload.eventType === 'INSERT') {
+       // Check if we already have this ID (to prevent duplicates from instant update)
+       setMessages(prev => {
+         if (prev.find(m => m.id === payload.new.id)) return prev;
+         return [payload.new, ...prev];
+       });
+    }
+    else if (payload.eventType === 'DELETE') {
+       setMessages(prev => prev.filter(msg => msg.id !== payload.old.id));
+    }
+    else if (payload.eventType === 'UPDATE') {
+       setMessages(prev => prev.map(msg => msg.id === payload.new.id ? payload.new : msg));
+    }
   };
 
   const fetchMessages = async () => {
@@ -162,7 +175,6 @@ export default function ChatScreen({ route, navigation }) {
       setRecording(null); 
       
       if (uri) {
-        // Send as object to uploadFile
         await uploadFile({ uri }, 'audio');
       }
     } catch (error) {
@@ -260,17 +272,70 @@ export default function ChatScreen({ route, navigation }) {
     setInputText(''); 
 
     if (editingMessage) {
-      await supabase.from('messages').update({ content: textToSend }).eq('id', editingMessage.id);
-      setEditingMessage(null);
+      // 🔥 1. INSTANTLY UPDATE UI (Optimistic)
+      setMessages(prev => prev.map(msg => 
+        msg.id === editingMessage.id ? { ...msg, content: textToSend } : msg
+      ));
+      
+      const messageIdToEdit = editingMessage.id;
+      setEditingMessage(null); // Close edit mode immediately
+
+      // 🔥 2. SEND TO SERVER
+      const { error } = await supabase
+        .from('messages')
+        .update({ content: textToSend })
+        .eq('id', messageIdToEdit);
+      
+      if (error) Alert.alert("Error", "Failed to save edit");
+    
     } else {
       await sendMessage(textToSend, null, null);
     }
   };
 
+  // --- 🔥 LONG PRESS HANDLER (Edit/Delete) ---
+  const handleLongPress = (item) => {
+    if (item.sender_id !== currentUserId) return; 
+
+    Alert.alert(
+      "Message Options",
+      "Choose an action",
+      [
+        { text: "Cancel", style: "cancel" },
+        { 
+          text: "Edit", 
+          onPress: () => {
+            if (item.image_url || item.audio_url) {
+              Alert.alert("Cannot Edit", "You can only edit text messages.");
+              return;
+            }
+            setInputText(item.content);
+            setEditingMessage(item);
+          } 
+        },
+        { 
+          text: "Delete", 
+          style: "destructive",
+          onPress: async () => {
+            // 🔥 1. INSTANTLY REMOVE FROM UI (Optimistic Delete)
+            setMessages(current => current.filter(m => m.id !== item.id));
+
+            // 🔥 2. TELL SERVER TO DELETE
+            const { error } = await supabase.from('messages').delete().eq('id', item.id);
+            if (error) {
+               Alert.alert("Error", "Could not delete message");
+               // Optionally add it back if it failed, but usually not needed for chat
+            }
+          }
+        }
+      ]
+    );
+  };
+
   const renderMessage = ({ item }) => {
     const isMe = item.sender_id === currentUserId;
     const isPlaying = playingAudioId === item.id;
-    const isImage = !!item.image_url; // Check if it's an image
+    const isImage = !!item.image_url; 
     const timeString = new Date(item.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
     return (
@@ -289,17 +354,18 @@ export default function ChatScreen({ route, navigation }) {
         <View style={{ maxWidth: '80%' }}>
            {!isMe && <Text style={styles.senderName}>{item.sender_name}</Text>}
            
-           <View style={[
-             styles.bubble, 
-             isMe ? styles.myBubble : styles.theirBubble,
-             // 🔥 THIS IS THE FIX: Remove background and padding if it is an image
-             isImage && { backgroundColor: 'transparent', padding: 0 }
-           ]}>
+           <TouchableOpacity 
+             onLongPress={() => handleLongPress(item)} 
+             activeOpacity={0.8}
+             style={[
+               styles.bubble, 
+               isMe ? styles.myBubble : styles.theirBubble,
+               isImage && { backgroundColor: 'transparent', padding: 0 }
+             ]}
+           >
              
-             {/* IMAGE */}
              {isImage && <Image source={{ uri: item.image_url }} style={styles.messageImage} />}
              
-             {/* AUDIO PLAYER */}
              {item.audio_url && (
                 <TouchableOpacity style={styles.audioBubble} onPress={() => playSound(item.audio_url, item.id)}>
                    <Ionicons 
@@ -313,19 +379,17 @@ export default function ChatScreen({ route, navigation }) {
                 </TouchableOpacity>
              )}
 
-             {/* TEXT */}
              {(!item.image_url && !item.audio_url) && (
                <Text style={[styles.messageText, isMe ? styles.myText : styles.theirText]}>{item.content}</Text>
              )}
 
-             {/* TIME - If it is an image, force dark color because background is now light */}
              <Text style={[
                styles.timeText, 
                (isMe && !isImage) ? styles.myTimeText : styles.theirTimeText
              ]}>
                {timeString}
              </Text>
-           </View>
+           </TouchableOpacity>
         </View>
       </View>
     );
@@ -344,6 +408,16 @@ export default function ChatScreen({ route, navigation }) {
       />
       
       <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} keyboardVerticalOffset={90}>
+        
+        {editingMessage && (
+          <View style={styles.editingContainer}>
+            <Text style={styles.editingText}>Editing message...</Text>
+            <TouchableOpacity onPress={() => { setEditingMessage(null); setInputText(''); }}>
+              <Ionicons name="close-circle" size={24} color="#FF3B30" />
+            </TouchableOpacity>
+          </View>
+        )}
+
         {typingText !== '' && <View style={styles.typingContainer}><Text style={styles.typingText}>{typingText}</Text></View>}
         
         <View style={styles.inputContainer}>
@@ -353,7 +427,7 @@ export default function ChatScreen({ route, navigation }) {
 
           <TextInput 
             style={styles.input} 
-            placeholder="Type a message..." 
+            placeholder={editingMessage ? "Edit your message..." : "Type a message..."} 
             value={inputText} 
             onChangeText={handleInputChange} 
             multiline 
@@ -361,7 +435,7 @@ export default function ChatScreen({ route, navigation }) {
 
           {inputText.trim() ? (
             <TouchableOpacity onPress={handleSendOrUpdate} style={styles.sendButton}>
-               <Ionicons name="send" size={24} color="#fff" />
+               <Ionicons name={editingMessage ? "checkmark" : "send"} size={24} color="#fff" />
             </TouchableOpacity>
           ) : (
             <TouchableOpacity 
@@ -398,12 +472,11 @@ const styles = StyleSheet.create({
   myText: { color: '#fff' },
   theirText: { color: '#000' },
   
-  // 🔥 UPDATED IMAGE STYLE (Corners + Sizing)
   messageImage: { 
     width: 200, 
     height: 300, 
     borderRadius: 15, 
-    resizeMode: 'cover', // Changed to cover so it looks nicer
+    resizeMode: 'cover', 
     marginBottom: 5 
   },
   
@@ -420,5 +493,11 @@ const styles = StyleSheet.create({
   micButton: { backgroundColor: '#34C759', width: 45, height: 45, borderRadius: 22.5, justifyContent: 'center', alignItems: 'center' },
   recordingButton: { backgroundColor: '#FF3B30' },
   typingContainer: { paddingHorizontal: 20, paddingBottom: 5, backgroundColor: '#f5f5f5' },
-  typingText: { fontSize: 12, color: '#888', fontStyle: 'italic' }
+  typingText: { fontSize: 12, color: '#888', fontStyle: 'italic' },
+  
+  editingContainer: { 
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', 
+    backgroundColor: '#FFF8E1', padding: 10, borderTopWidth: 1, borderColor: '#eee' 
+  },
+  editingText: { color: '#F57C00', fontWeight: 'bold' }
 });
